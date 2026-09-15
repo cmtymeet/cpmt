@@ -1,0 +1,169 @@
+//! Entitlement-only recurring-payment assertion with member binding.
+//!
+//! The intermediary owns the billing relationship. The library verifies an
+//! Ed25519-signed entitlement for one member commitment with expiry and
+//! replay guard. Customer and payment ids are forbidden here: a filter that
+//! merely drops fields does not meet the boundary.
+
+use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+use sha2::{Digest, Sha256};
+
+/// Entitlement as asserted by the independent intermediary.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct Entitlement {
+    /// Opaque member commitment (e.g. hash of member id + community).
+    /// Must not be a provider customer id the operator could resolve.
+    pub commitment: String,
+    /// Expiry as unix seconds per host clock. Automatic renewal updates this.
+    pub valid_until: u64,
+    /// Unique assertion id for replay protection within the validity window.
+    pub assertion_id: String,
+    /// Intermediary signature over assertion bytes.
+    pub signature: Vec<u8>,
+}
+
+/// Errors carry no customer, payment or member identity.
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum Error {
+    /// Expired, bad signature, replayed or malformed. Uniform.
+    #[error("entitlement rejected")]
+    Rejected,
+}
+
+/// Canonical assertion bytes the intermediary signs.
+#[must_use]
+pub fn assertion_bytes(commitment: &str, valid_until: u64, assertion_id: &str) -> Vec<u8> {
+    serde_json::to_vec(&serde_json::json!([
+        "cpmt.assertion.v1",
+        commitment,
+        valid_until,
+        assertion_id,
+    ]))
+    .expect("JSON serializes")
+}
+
+/// Member commitment: hash of member id scoped to community.
+/// The intermediary receives this commitment, never the raw member id graph.
+#[must_use]
+pub fn commitment(community_id: &str, member_id: &[u8]) -> String {
+    let mut h = Sha256::new();
+    h.update(b"cpmt.commitment.v1\n");
+    h.update(community_id.as_bytes());
+    h.update(b"\n");
+    h.update(member_id);
+    hex(&h.finalize())
+}
+
+/// Verify an entitlement: signature, expiry and non-empty fields.
+/// Replay-window enforcement (assertion_id seen-store with TTL) belongs
+/// in the host; call [`replay_key`] for the store key.
+pub fn verify(
+    entitlement: &Entitlement,
+    intermediary_key: &VerifyingKey,
+    now_secs: u64,
+) -> Result<(), Error> {
+    if entitlement.commitment.is_empty()
+        || entitlement.commitment.len() > 128
+        || entitlement.assertion_id.is_empty()
+        || entitlement.assertion_id.len() > 128
+    {
+        return Err(Error::Rejected);
+    }
+    if entitlement.commitment.starts_with("cus_")
+        || entitlement.commitment.starts_with("pay_")
+        || entitlement.commitment.starts_with("sub_")
+    {
+        // Provider customer/payment/subscription ids are forbidden here.
+        return Err(Error::Rejected);
+    }
+    if now_secs >= entitlement.valid_until {
+        return Err(Error::Rejected);
+    }
+    let msg = assertion_bytes(
+        &entitlement.commitment,
+        entitlement.valid_until,
+        &entitlement.assertion_id,
+    );
+    let sig = Signature::from_slice(&entitlement.signature).map_err(|_| Error::Rejected)?;
+    intermediary_key
+        .verify(&msg, &sig)
+        .map_err(|_| Error::Rejected)?;
+    Ok(())
+}
+
+/// Store key for host replay window: hash of assertion id.
+#[must_use]
+pub fn replay_key(assertion_id: &str) -> String {
+    let mut h = Sha256::new();
+    h.update(b"cpmt.replay.v1\n");
+    h.update(assertion_id.as_bytes());
+    hex(&h.finalize())
+}
+
+/// Attestation bytes the host signs with Ed25519 for cvld issuance.
+/// Contains commitment and expiry only.
+#[must_use]
+pub fn attestation_bytes(commitment: &str, valid_until: u64) -> Vec<u8> {
+    serde_json::to_vec(&serde_json::json!([
+        "cpmt.attestation.v1",
+        commitment,
+        valid_until
+    ]))
+    .expect("JSON serializes")
+}
+
+fn hex(bytes: &[u8]) -> String {
+    use std::fmt::Write;
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        let _ = write!(out, "{b:02x}");
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ed25519_dalek::SigningKey;
+
+    fn intermediary() -> (SigningKey, VerifyingKey) {
+        let sk = SigningKey::from_bytes(&[11u8; 32]);
+        let vk = sk.verifying_key();
+        (sk, vk)
+    }
+
+    fn signed(commitment: &str, valid_until: u64, id: &str) -> Entitlement {
+        let (sk, _) = intermediary();
+        let msg = assertion_bytes(commitment, valid_until, id);
+        use ed25519_dalek::Signer;
+        let sig = sk.sign(&msg).to_bytes().to_vec();
+        Entitlement {
+            commitment: commitment.into(),
+            valid_until,
+            assertion_id: id.into(),
+            signature: sig,
+        }
+    }
+
+    #[test]
+    fn roundtrip_and_expiry() {
+        let (_, vk) = intermediary();
+        let e = signed(&commitment("alpha", b"m1"), 2000, "a-1");
+        assert!(verify(&e, &vk, 1000).is_ok());
+        assert_eq!(verify(&e, &vk, 2000), Err(Error::Rejected));
+    }
+
+    #[test]
+    fn provider_ids_rejected() {
+        let (_, vk) = intermediary();
+        for forbidden in ["cus_123", "pay_123", "sub_123"] {
+            let e = signed(forbidden, 2000, "a-2");
+            assert_eq!(verify(&e, &vk, 1000), Err(Error::Rejected));
+        }
+    }
+
+    #[test]
+    fn commitment_is_community_scoped() {
+        assert_ne!(commitment("alpha", b"m1"), commitment("beta", b"m1"));
+    }
+}
